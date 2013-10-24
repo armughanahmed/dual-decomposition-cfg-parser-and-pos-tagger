@@ -1,3 +1,4 @@
+import itertools
 import re
 import time
 import io
@@ -7,11 +8,32 @@ from collections import defaultdict, namedtuple
 import math
 import pprint
 import os
+import ann_bies_map
 
 Rule = namedtuple('Rule', 'lhs, rhs')
 Terminal = namedtuple('Terminal', 'value')
 Nonterminal = namedtuple('Nonterminal', 'value')
 Subtree = namedtuple('Subtree', 'parent, children')
+
+atb_nonterminals_complex_parts = set( [ 'J', 'I', 'D', 'MP', 'IV', 'POSS', 'MS', 'P', 'FS', 'DTV', 'FP', 'MD', 'FD', 'SBJ','OBJ','VN','NSUFF','MASC','FEM','GEN','DU','ACCGEN','ACC','CASE','DEF','INDEF','IVSUFF','SUBJ','MP','MOOD','SJ','I','S', 'ACC','NOM','GEN','MASC','FEM','DU','PL','SG','TTL','DIR', 'TMP', 'PRP','CLR','LOC','PRD','MNR','TPC','ADV','NOM','HLN','GEN','LGS','VOC', 'DO', 'PVSUFF', 'PART', 'F', 'DET', 'COMP' ] )
+
+#avoid_complex_parts = set( [ 'DET_TYPO', 'DET_DIALECT', 'DIALECT', 'X' ] )
+
+vocab_encoder = {}
+vocab_decoder = []
+
+def __encode(object):
+  if object in vocab_encoder:
+    return vocab_encoder[object]
+  else:
+    id = len(vocab_encoder)
+    vocab_encoder[object] = id
+    vocab_decoder.append(object)
+    assert len(vocab_encoder) == len(vocab_decoder)
+    return id
+
+def __decode(id):
+  return vocab_decoder[id]
 
 '''
 reads the parse string by iteratively replacing ( stuff ) with a subtree id. elegant but not efficient.
@@ -19,6 +41,7 @@ reads the parse string by iteratively replacing ( stuff ) with a subtree id. ele
 for example: 
 >> ReadParseTree('(S (NP (A good) (N boys)) (VP (V sleep)))')
 '''
+uniq_nont = defaultdict(int)
 def ReadParseTree(parse_string):
   rule_matcher = re.compile('(\([^\(\)]+\))')
   placeholder_prefix = '_|+|_'
@@ -32,6 +55,20 @@ def ReadParseTree(parse_string):
       if parts[i].startswith(placeholder_prefix):
         parts[i] = nodes[parts[i]]
       elif i == 0:
+        if args.simplify_atb_nonterminals:
+          if parts[i] in ann_bies_map.ann_bies.keys():
+            parts[i] = ann_bies_map.ann_bies[parts[i]]
+          else:
+            all_symbols = re.findall(r'[A-Z]+', parts[i])
+            good_symbols = [ all_symbols[0] ]
+            for j in range(1, len(all_symbols)):
+              if all_symbols[j] in atb_nonterminals_complex_parts:
+                continue
+              good_symbols.append( all_symbols[j] )
+            if len(good_symbols) > 1 and good_symbols[0] == 'DET':
+              del good_symbols[0]
+            parts[i] = '_'.join(good_symbols)
+        uniq_nont[ parts[i] ] += 1
         parts[i] = Nonterminal(value=parts[i])
       else:
         parts[i] = Terminal(value=parts[i])
@@ -50,16 +87,20 @@ for example:
 
 '( S ( NP ( A good ) ( N boys ) ) ( VP ( V sleep ) ) )'
 '''
-def WriteParseSubtree(subtree):
+def WriteParseSubtree(subtree, decode=False):
   assert subtree is not None, 'subtree is none!'
-  if subtree is None:
-    exit(1)
-  new_parts = ['(', str(subtree.parent.value)]
+  if decode:
+    new_parts = ['(', str( __decode(subtree.parent.value) )]
+  else:
+    new_parts = ['(', str(subtree.parent.value)]
   for child in subtree.children:
     if type(child) is Terminal:
-      new_parts.append(child.value)
+      if decode:
+        new_parts.append( __decode(child.value) )
+      else:
+        new_parts.append(child.value)
     else:
-      new_parts.append(WriteParseSubtree(child))
+      new_parts.append( WriteParseSubtree(child, decode) )
   new_parts.append(')')
   return ' '.join(new_parts)
 
@@ -86,7 +127,6 @@ def EstimatePcfgFromParseTrees(parse_trees):
   # count
   #unique_lhs, unique_rhs = set(), set()
   pcfg = {}
-  # pcfg[Nonterminal(SOS)] = {}
   counter = 0
   for subtree in parse_trees:
     counter += 1
@@ -205,7 +245,8 @@ def ConvertSubtreeIntoChomskyNormalForm(subtree):
   # CNF may have been violated. Lets make local fixes first.
   # one non-terminal child
   if len(subtree.children) == 1 and type(subtree.children[0]) is Subtree:
-    new_parent = UNARY_SEPARATOR.join([subtree.parent.value, subtree.children[0].parent.value])
+    #  new_parent = UNARY_SEPARATOR.join([subtree.parent.value, subtree.children[0].parent.value])
+    new_parent = subtree.children[0].parent.value
     new_children = subtree.children[0].children
     subtree = Subtree(parent=Nonterminal(new_parent), children=new_children)
     return ConvertSubtreeIntoChomskyNormalForm(subtree)
@@ -312,7 +353,6 @@ def EvaluatePos(candidate_postags, reference_postags):
 given a complete table
 '''
 def CykBacktrack(table, index):
-  assert type(table[index].lhs) is Nonterminal
   subtree = Subtree(parent = table[index].lhs, children = [])
   # basecase
   if table[index].leftchild_index is None:
@@ -326,30 +366,58 @@ def CykBacktrack(table, index):
 cyk
 table maps a tuple (length, start, nonterminal) to CykTuple
 '''
-def CykParse(tokens, pcfg, start_symbol):
+def CykParse(tokens, pcfg, start_symbol, preterminals, rhs_to_lhs_index):
   CykTuple = namedtuple('CykTuple', 'lhs, rhs, logprob, leftchild_index, rightchild_index')
   table = {}
+  cell_to_nonterminals_index = defaultdict(set)
   for length in range(1, len(tokens)+1):
+    #print 'length = ', length
     for start in range(0, len(tokens)-length+1):
+      #print 'start = ', start
       # find a rule that matches this token
       if length == 1:
-        for lhs in pcfg.keys():
-          for rhs in pcfg[lhs].keys():
-            if len(rhs) == 1 and type(rhs[0]) is Terminal and rhs[0].value == tokens[start]:
-              table[(length, start, lhs)] = CykTuple(lhs=lhs, rhs=rhs, logprob=pcfg[lhs][rhs], leftchild_index=None, rightchild_index=None)
+        rhs = (Terminal(value=tokens[start]),)
+        # token is an OOV
+        if rhs not in rhs_to_lhs_index:
+          if not args.handle_oov: 
+            return None
+          print 'token ', __decode(tokens[start]), ' is OOV :-/'
+          for nonterminal in preterminals:
+            cell_to_nonterminals_index[(length, start)].add(nonterminal)
+            table[(length, start, nonterminal)] = CykTuple(lhs=nonterminal,
+                                                           rhs=(Terminal(value=tokens[start]),),
+                                                           logprob=0.0,
+                                                           leftchild_index=None,
+                                                           rightchild_index=None)
+          # end of token is an OOV
+        else:  
+          for lhs in rhs_to_lhs_index[rhs]:
+            cell_to_nonterminals_index[(length, start)].add(lhs)
+            table[(length, start, lhs)] = CykTuple(lhs=lhs, 
+                                                   rhs=rhs, 
+                                                   logprob=pcfg[lhs][rhs], 
+                                                   leftchild_index=None, 
+                                                   rightchild_index=None)
         # end of length == 1
       # for each possible split point
       for split in range(start+1, start+length):
-        for lhs in pcfg.keys():
-          for rhs in pcfg[lhs].keys():
-            if len(rhs) == 1: continue
-            leftchild_index, rightchild_index = (split - start, start, rhs[0]), (length - split + start, split, rhs[1])
-            if len(rhs) == 2 and leftchild_index in table and rightchild_index in table:
-              match = CykTuple(lhs=lhs, rhs=rhs, \
-                                 logprob = table[leftchild_index].logprob + table[rightchild_index].logprob + pcfg[lhs][rhs], \
-                                 leftchild_index=leftchild_index, \
-                                 rightchild_index=rightchild_index)
+        #print 'split = ', split
+        leftchild_index, rightchild_index = (split - start, start), (length - split + start, split)
+        #print 'evaluating ', len(cell_to_nonterminals_index[leftchild_index]), ' X ', len(cell_to_nonterminals_index[rightchild_index]), ' possible rules with this split at this cell'
+        for left_nonterminal in cell_to_nonterminals_index[leftchild_index]:
+          for right_nonterminal in cell_to_nonterminals_index[rightchild_index]:
+            rhs = (left_nonterminal, right_nonterminal)
+            left_logprob = table[(leftchild_index[0], leftchild_index[1], left_nonterminal)].logprob
+            right_logprob = table[(rightchild_index[0], rightchild_index[1], right_nonterminal)].logprob
+            if rhs not in rhs_to_lhs_index:
+              continue
+            for lhs in rhs_to_lhs_index[rhs]:
+              match = CykTuple(lhs=lhs, rhs=rhs, 
+                               logprob = left_logprob + right_logprob + pcfg[lhs][rhs],
+                               leftchild_index=(leftchild_index[0], leftchild_index[1], left_nonterminal), 
+                               rightchild_index=(rightchild_index[0], rightchild_index[1], right_nonterminal))
               if (length, start, lhs) not in table or table[(length, start, lhs)].logprob < match.logprob:
+                cell_to_nonterminals_index[(length, start)].add(lhs)
                 table[ (length, start, lhs) ] = match
             # done processing this rule
           # done processing this lhs
@@ -359,42 +427,60 @@ def CykParse(tokens, pcfg, start_symbol):
   # done processing all rows in the cyk table, time to backtrack (if any complete parse is available)
   if (len(tokens), 0, Nonterminal(start_symbol)) not in table:
     return None
-  return CykBacktrack(table, (len(tokens), 0, Nonterminal(start_symbol)))
+  tree = CykBacktrack(table, (len(tokens), 0, Nonterminal(start_symbol)))
+  return tree
 
-def HmmViterbi(tokens, transitions, emissions):
+def HmmViterbi(tokens, transitions, emissions, words_to_states):
   alpha = {}
   AlphaIndex = namedtuple('AlphaIndex', 'position, state')
   AlphaValue = namedtuple('AlphaValue', 'logprob, prev_state')
-  alpha[ AlphaIndex(position=-1, state=Nonterminal(SOS)) ] = AlphaValue(logprob=0, prev_state=None) # you are at the start-of-sent state with prob 1 at the beginning
+  alpha[ AlphaIndex(position=-1, state=__encode(SOS)) ] = AlphaValue(logprob=0, prev_state=None) # you are at the start-of-sent state with prob 1 at the beginning
+  position_to_states = {}
+  position_to_states[-1] = [__encode(SOS)]
   for position in range(0, len(tokens)):
-    for current_state in transitions.keys():
-      for previous_state in transitions.keys():
-        if AlphaIndex(position=position-1, state=previous_state) not in alpha or \
-              current_state not in transitions[previous_state] or \
-              current_state not in emissions or \
-              Terminal(tokens[position]) not in emissions[current_state]:
-          continue  
+    # OOV
+    observation = tokens[position]
+    if observation not in words_to_states:
+      if args.handle_oov:
+        words_to_states[observation] = set()
+        for state in emissions.keys():
+          emissions[state][observation] = 0
+          words_to_states[observation].add(state)
+      else:
+        return None
+      # end of OOV
+    for current_state in words_to_states[observation]:      
+      for previous_state in position_to_states[position-1]:        
+        if current_state not in transitions[previous_state]:
+          continue          
         forward_score = alpha[ AlphaIndex(position=position-1, state=previous_state) ].logprob + \
             transitions[previous_state][current_state] + \
-            emissions[current_state][Terminal(tokens[position])]
+            emissions[current_state][tokens[position]]
         if AlphaIndex(position=position, state=current_state) not in alpha or \
               alpha[AlphaIndex(position=position, state=current_state)] < AlphaValue(logprob=forward_score, prev_state=previous_state):
           alpha[AlphaIndex(position=position, state=current_state)] = \
               AlphaValue(logprob=forward_score, prev_state=previous_state)
+          if position not in position_to_states:
+            position_to_states[position] = set()
+          position_to_states[position].add(current_state)
         # done considering a particular previous state
       # done considering a particular current state
+    # don't waste your time if none of the states fit this position
+    if position not in position_to_states:
+      return None
     # done processing a particular position
   # reached the end of the sentence, but haven't considered the transition to end-of-sentence state
   # add alpha entries which take into consideration end of sentence boundaries
-  for key in alpha.keys():
-    if key.position != len(tokens)-1 or Nonterminal(SOS) not in transitions[key.state]:
+  for previous_state in position_to_states[len(tokens)-1]:
+    index = AlphaIndex(position=len(tokens)-1, state=previous_state)
+    if __encode(SOS) not in transitions[previous_state]:
       continue
-    forward_score = alpha[key].logprob + transitions[key.state][Nonterminal(SOS)]
-    if AlphaIndex(position=len(tokens), state=Nonterminal(SOS)) not in alpha or \
-          alpha[ AlphaIndex(position=len(tokens), state=Nonterminal(SOS)) ] < AlphaValue(logprob=forward_score, prev_state=key.state):
-      alpha[ AlphaIndex(position=len(tokens), state=Nonterminal(SOS)) ] = AlphaValue(logprob=forward_score, prev_state=key.state)
+    forward_score = alpha[index].logprob + transitions[previous_state][__encode(SOS)]
+    if AlphaIndex(position=len(tokens), state=__encode(SOS)) not in alpha or \
+          alpha[ AlphaIndex(position=len(tokens), state=__encode(SOS)) ] < AlphaValue(logprob=forward_score, prev_state=previous_state):
+      alpha[ AlphaIndex(position=len(tokens), state=__encode(SOS)) ] = AlphaValue(logprob=forward_score, prev_state=previous_state)
   # backtrack
-  current_state = Nonterminal(SOS)
+  current_state = __encode(SOS)
   viterbi_tag_sequence = []
   for position in reversed(range(1, len(tokens)+1)):
     if AlphaIndex(position, current_state) not in alpha:
@@ -411,34 +497,43 @@ def ReadTreebankDir(treebank_dir):
     if not filename.endswith('.tree'): continue
     for line in io.open(filename, encoding='utf8'):
       parses.append(ReadParseTree(line.strip()))
+  print 'len(uniq_nont)  = ', len(uniq_nont)
+  for n in uniq_nont:
+    print n
   return parses
 
 
 # parse/validate arguments
 argParser = argparse.ArgumentParser()
-argParser.add_argument("--create_hw", type=bool, default=True)
-argParser.add_argument("--solve_hw", type=bool, default=True)
-argParser.add_argument("--treebank_dir", type=str, default='/usr1/home/wammar/atb3_v3_2/data/penntree/without-vowel/')
-argParser.add_argument("--dev_sents_filename", type=str, default='dev_sents')
-argParser.add_argument("--dev_parses_filename", type=str, default='dev_parses')
-argParser.add_argument("--dev_postags_filename", type=str, default='dev_postags')
-argParser.add_argument("--test_sents_filename", type=str, default='test_sents')
-argParser.add_argument("--test_parses_filename", type=str, default='test_parses')
-argParser.add_argument("--test_postags_filename", type=str, default='test_postags')
-argParser.add_argument("--train_sents_filename", type=str, default='train_sents')
-argParser.add_argument("--train_parses_filename", type=str, default='train_parses')
-argParser.add_argument("--train_postags_filename", type=str, default='train_postags')
-argParser.add_argument("--hmm_transitions_filename", type=str, default='hmm_trans')
-argParser.add_argument("--hmm_emissions_filename", type=str, default='hmm_emits')
-argParser.add_argument("--pcfg_filename", type=str, default='pcfg')
-argParser.add_argument("--candid_dev_parses_filename", type=str, default='candid_dev_parses')
-argParser.add_argument("--candid_dev_postags_filename", type=str, default='candid_dev_postags')
-argParser.add_argument("--candid_test_parses_filename", type=str, default='candid_test_parses')
-argParser.add_argument("--candid_test_postags_filename", type=str, default='candid_test_postags')
+argParser.add_argument("--decode_testset", default=True)
+argParser.add_argument("--simplify_atb_nonterminals", default=True)
+argParser.add_argument("--max_sent_length", type=int, default=20)
+argParser.add_argument("--create_hw", default=False)
+argParser.add_argument("--solve_hw", default=True)
+argParser.add_argument("--handle_oov", default=False)
+argParser.add_argument("--treebank_dir", default='arabic_penntreebank_v3.2/')
+argParser.add_argument("--vocab_filename", default='vocab')
+argParser.add_argument("--dev_sents_filename", default='dev_sents')
+argParser.add_argument("--dev_parses_filename", default='dev_parses')
+argParser.add_argument("--dev_postags_filename", default='dev_postags')
+argParser.add_argument("--test_sents_filename", default='test_sents')
+argParser.add_argument("--test_parses_filename", default='test_parses')
+argParser.add_argument("--test_postags_filename", default='test_postags')
+argParser.add_argument("--train_sents_filename", default='train_sents')
+argParser.add_argument("--train_parses_filename", default='train_parses')
+argParser.add_argument("--train_postags_filename", default='train_postags')
+argParser.add_argument("--hmm_transitions_filename", default='hmm_trans')
+argParser.add_argument("--hmm_emissions_filename", default='hmm_emits')
+argParser.add_argument("--pcfg_filename", default='pcfg')
+argParser.add_argument("--candid_dev_parses_filename", default='candid_dev_parses')
+argParser.add_argument("--candid_dev_postags_filename", default='candid_dev_postags')
+argParser.add_argument("--candid_test_parses_filename", default='candid_test_parses')
+argParser.add_argument("--candid_test_postags_filename", default='candid_test_postags')
 args = argParser.parse_args()
 
 
 if args.create_hw:
+  print 'create_hw = ', args.create_hw
   # read all of the Arabic treebank
   parses = ReadTreebankDir(args.treebank_dir)
   print len(parses), ' parses read.'
@@ -466,13 +561,13 @@ if args.create_hw:
     #print parse_string
     postags_string = u'{0}\n'.format(' '.join(tags))
     # distribute on train, dev, test
-    if tree_id % 10 == 0:
+    if tree_id % 100 < 4 and len(tokens) <= args.max_sent_length:
       dev.append(tree)
       dev_sents_file.write(sent)
       dev_sents.append(sent)
       dev_parses_file.write(parse_string)
       dev_postags_file.write(postags_string)
-    elif tree_id % 10 == 1:
+    elif tree_id % 100 < 8 and len(tokens) <= args.max_sent_length:
       test.append(tree)
       test_sents_file.write(sent)
       test_sents.append(sent)
@@ -520,69 +615,122 @@ if args.create_hw:
   pcfg_file.close()
   pcfg_file.close()
 
+  with io.open(args.vocab_filename, encoding='utf8', mode='w') as vocab_file:
+    vocab = set()
+    for sent in itertools.chain(train_sents, dev_sents, test_sents):
+      for token in sent.strip().split():
+        vocab.add(token)
+    for wordtype in vocab:
+      vocab_file.write(u'{0}\n'.format(wordtype))
+
 if args.solve_hw:
-  print 'now decoding the dev set...'
+  # read vocab
+  with io.open(args.vocab_filename, encoding='utf8') as vocab_file:
+    vocab = set()
+    for wordtype in vocab_file:
+      vocab.add(wordtype.strip())
+
+  # read sents
+  print 'reading sents...'
+  train_sents_file, dev_sents_file, test_sents_file = io.open(args.train_sents_filename, encoding='utf8'), io.open(args.dev_sents_filename, encoding='utf8'), io.open(args.test_sents_filename, encoding='utf8')
+  train_sents, dev_sents, test_sents = train_sents_file.readlines(), dev_sents_file.readlines(), test_sents_file.readlines()
+  train_sents_file.close(); dev_sents_file.close(); test_sents_file.close();
+
+  # read pcfg
+  print 'reading pcfg...'
+  pcfg = {}
+  rhs_to_lhs_index = {}
+  nonterminals = set()
+  with io.open(args.pcfg_filename, encoding='utf8') as pcfg_file:
+    for line in pcfg_file:
+      context_string, decision_string, logprob = line.strip().split('\t')
+      context = Nonterminal(value=__encode(context_string))
+      nonterminals.add(context)
+      rhs = []
+      for rhs_element in decision_string.split():
+        if rhs_element in vocab:
+          rhs.append( Terminal(value=__encode(rhs_element)) )
+        else:
+          rhs.append( Nonterminal(value=__encode(rhs_element)) )
+      decision = tuple( rhs )
+      if context not in pcfg:
+        pcfg[context] = {}
+      pcfg[context][decision] = float(logprob)
+      if decision not in rhs_to_lhs_index:
+        rhs_to_lhs_index[decision] = set()
+      rhs_to_lhs_index[decision].add(context)
+  #print 'len(nonterminals) = ', len(nonterminals)
+  #for nonterminal in nonterminals:
+  #  print __decode(nonterminal.value)
+
+  # read hmm
+  transitions, emissions = {}, {}
+  words_to_states = {}
+  with io.open(args.hmm_transitions_filename, encoding='utf8') as hmm_transitions_file:
+    for line in hmm_transitions_file:
+      context, decision, logprob = line.strip().split('\t')
+      context, decision = __encode(context), __encode(decision)
+      if context not in transitions:
+        transitions[context] = {}
+      transitions[context][decision] = float(logprob)
+  with io.open(args.hmm_emissions_filename, encoding='utf8') as hmm_emissions_file:
+    for line in hmm_emissions_file:
+      context, decision, logprob = line.strip().split('\t')
+      context, decision = __encode(context), __encode(decision)
+      if context not in emissions:
+        emissions[context] = {}
+      emissions[context][decision] = float(logprob)
+      if decision not in words_to_states:
+        words_to_states[decision] = set()
+      words_to_states[decision].add(context)
+
+  # use the preterminals as potential unary parse rules for OOV words
+  preterminals = list(emissions.keys())
+  for i in xrange(len(preterminals)):
+    preterminals[i] = Nonterminal(value=preterminals[i])
+
+  print 'now decoding ...'
   # use the pcfg models to parse something
   # use the hmm model to parse something
-  candid_dev_parses_file = io.open(args.candid_dev_parses_filename, encoding='utf8', mode='w')
-  candid_dev_postags_file = io.open(args.candid_dev_postags_filename, encoding='utf8', mode='w')
+  if args.decode_testset:
+    candid_parses_file = io.open(args.candid_test_parses_filename, encoding='utf8', mode='w')
+    candid_postags_file = io.open(args.candid_test_postags_filename, encoding='utf8', mode='w')
+    sents = test_sents
+  else:
+    candid_parses_file = io.open(args.candid_dev_parses_filename, encoding='utf8', mode='w')
+    candid_postags_file = io.open(args.candid_dev_postags_filename, encoding='utf8', mode='w')    
+    sents = dev_sents
   parse_failures, tagging_failures = 0, 0
-  for i in xrange(len(dev_sents)):
-    sent = dev_sents[i]
+  sent_id = 0
+  for i in xrange(len(sents)):
+    sent = sents[i].strip()
+    tokens = sent.split()
+    for i in xrange(len(tokens)):
+      tokens[i] = __encode(tokens[i])
+    print 'now processing sent ', sent_id, ': ', sent
+    sent_id += 1
     # parse
-    tree = CykParse(sent.split(), pcfg, u'S')
+    tree = CykParse(tokens, pcfg, __encode(u'S'), preterminals, rhs_to_lhs_index)
     if tree is None:
       parse_failures += 1
-      candid_dev_parses_file.write(u'\n')
+      candid_parses_file.write(u'\n')
+      print 'parse: None'
     else:
-      candid_dev_parses_file.write(u'{0}\n'.format(WriteParseSubtree(tree)))
+      candid_parses_file.write(u'{0}\n'.format(WriteParseSubtree(tree, decode=True)))
+      print 'parse: ', WriteParseSubtree(tree, decode=True)
     # tag
-    tagging = HmmViterbi(sent.split(), transitions, emissions)
+    tagging = HmmViterbi(tokens, transitions, emissions, words_to_states)
+    if tagging:
+      for i in xrange(len(tagging)):
+        tagging[i] = __decode(tagging[i])
+    print 'tagging: ', tagging
+    print 
     if tagging is None:
       tagging_failures += 1
-      candid_dev_postags_file.write(u'\n')
+      candid_postags_file.write(u'\n')
     else:
-      candid_dev_postags_file.write(u'{0}\n', ' '.join(tagging))
-  print tagging_failures, ' failures tagging ', len(dev_sents), ' sents'
-  print parse_failures, ' failures cyk parsing ', len(dev_sents), ' sents' 
-  candid_dev_parses_file.close()
-  candid_dev_postags_file.close()
-
-#ref_tree = ReadParseTree('(S (NP (ADJ good) (N boys)) (VP sleep))')
-#can_tree = ReadParseTree('(S (NP (ADJ good) (N boys)) (VP sleep2))')
-#print 'raw ref_tree is ', ref_tree
-#print 'ref_tree is ', WriteParseSubtree(ref_tree), '\n'
-#print 'can_tree is ', WriteParseSubtree(can_tree), '\n'
-
-# evaluation
-#unnormalized_precision, can_rules_count, unnormalized_recall, ref_rules_count = EvaluateParseTree(can_tree, ref_tree)
-#print 'precision=', unnormalized_precision / can_rules_count, ', recall=', unnormalized_recall / ref_rules_count
-#(ref_toks, ref_pos), (can_toks, can_pos) = ConvertParseTreeIntoPosSequence(ref_tree), ConvertParseTreeIntoPosSequence(can_tree)
-#print 'ref_pos = ', ref_pos
-#print 'can_pos = ', can_pos
-#correct, all = EvaluatePos(can_pos, ref_pos)
-#print correct, ' correct POS out of ', all
-
-# estimation
-#transitions, emissions = EstimateHmmPosTaggerFromParseTrees([ref_tree, can_tree])
-#pcfg = EstimatePcfgFromParseTrees([ref_tree, can_tree])
-#print '\npcfg='
-#for c in pcfg.keys():
-#  for d in pcfg[c].keys():
-#    print d,'|',c,'=',pcfg[c][d]
-
-# cyk
-#print 'now running cyk\n'
-#parse = CykParse(['sleep', 'boys', 'good'], pcfg, 'S')
-#print '\n raw parse = ', parse
-#print '\n nicely drawn parse=', WriteParseSubtree(parse)
-
-# hmm viterbi
-#print '\n now running hmm viterbi'
-#viterbi = HmmViterbi(['good', 'boys', 'sleep'], transitions, emissions)
-#print viterbi
-
-#cnf = ConvertSubtreeIntoChomskyNormalForm(tree)
-#print
-#print WriteParseSubtree(cnf)
-
+      candid_postags_file.write(u'{0}\n'.format( ' '.join(tagging)))
+  print tagging_failures, ' failures while tagging ', len(sents), ' sents'
+  print parse_failures, ' failures while cyk parsing ', len(sents), ' sents' 
+  candid_parses_file.close()
+  candid_postags_file.close()

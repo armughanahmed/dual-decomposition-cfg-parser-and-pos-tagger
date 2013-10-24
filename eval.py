@@ -112,7 +112,7 @@ if args.reference_postags_filename and args.candidate_postags_filename:
   ref_file, candid_file = io.open(args.reference_postags_filename), io.open(args.candidate_postags_filename)
   accuracy_numerator, accuracy_denominator = 0.0, 0.0
   for (ref_postags_string, candid_postags_string) in zip(ref_file, candid_file):
-    ref_postags, candid_postags = ref_postags_string.split(), candid_postags.string.split()
+    ref_postags, candid_postags = ref_postags_string.split(), candid_postags_string.split()
     (correct, total) = EvaluatePosTags(candid_postags, ref_postags)
     accuracy_numerator += correct
     accuracy_denominator += total
