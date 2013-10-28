@@ -10,6 +10,8 @@ Nonterminal = namedtuple('Nonterminal', 'value')
 Subtree = namedtuple('Subtree', 'parent, children')
 
 def ReadParseTree(parse_string):
+  if len(parse_string.strip()) == 0:
+    return None
   rule_matcher = re.compile('(\([^\(\)]+\))')
   placeholder_prefix = '_|+|_'
   nodes = {}
@@ -33,6 +35,8 @@ def ReadParseTree(parse_string):
   return new_subtree
 
 def ExtractRulesFromSubtree(subtree):
+  if subtree == None:
+    return []
   rules = []
   rhs = []
   for child in subtree.children:
